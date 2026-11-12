@@ -7,7 +7,7 @@ permissions:
   contents: read
 jobs:
   gpu:
-    runs-on: macos-26
+    runs-on: macos-15-intel
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -29,7 +29,7 @@ jobs:
           test "$(git -C drivers/AdrenoMetal rev-parse HEAD)" = 73d582fd4d5772b1f5fa83581a25077a16f2b6cd
           ln -s GopFramebuffer drivers/NativeMobileDisplay
           brew install bison flex glslang shaderc spirv-tools llvm ninja pkg-config
-          printf '%s\n' "$(brew --prefix bison)/bin" "$(brew --prefix flex)/bin" "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          printf '%s\n' "$(brew --prefix bison)/bin" "$(brew --prefix flex)/bin" "$(brew --prefix llvm)/bin" "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
           python3 -m venv .cache/mesa-venv
           .cache/mesa-venv/bin/pip install -r scripts/requirements-adreno-compiler.txt
