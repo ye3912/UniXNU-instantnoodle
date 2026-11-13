@@ -1,0 +1,150 @@
+name: IN2020 GPU R3 iOS17 BGRA display policy
+on:
+  push:
+    branches: [codex/in2020-gpu-r3-20261113]
+    paths: [.github/workflows/in2020-gpu-r3.yml, '.github/in2020/r3/**']
+permissions:
+  contents: read
+jobs:
+  gpu:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: board-build
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: UniXNU/UniXNU
+          ref: 2b545eae50733c62a18f175214c34e7122f82422
+          persist-credentials: false
+          path: unixnu
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Prepare pinned components and toolchain
+        working-directory: unixnu
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: |
+          xcrun --sdk iphoneos --show-sdk-path
+          git submodule update --init --depth 1 drivers/Adreno740 drivers/AdrenoMetal drivers/GopFramebuffer kits/AdrenoPM4
+          test "$(git -C drivers/AdrenoMetal rev-parse HEAD)" = 73d582fd4d5772b1f5fa83581a25077a16f2b6cd
+          ln -s GopFramebuffer drivers/NativeMobileDisplay
+          brew install bison flex glslang shaderc spirv-tools llvm ninja pkg-config
+          printf '%s\n' "$(brew --prefix bison)/bin" "$(brew --prefix flex)/bin" "$(brew --prefix llvm)/bin" "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
+          python3 -m venv .cache/mesa-venv
+          .cache/mesa-venv/bin/pip install -r scripts/requirements-adreno-compiler.txt
+      - name: Fetch and patch pinned compiler sources
+        working-directory: unixnu
+        run: |
+          python3 - <<'PY'
+          import json,subprocess
+          from pathlib import Path
+          def checkout(path, origin, revision, mirror=None):
+              path.mkdir(parents=True,exist_ok=True)
+              subprocess.run(['git','init','-q',str(path)],check=True)
+              base=['git','-C',str(path),'fetch','--depth=1']
+              first=subprocess.run([*base,origin,revision])
+              if first.returncode:
+                  if not mirror:first.check_returncode()
+                  subprocess.run([*base,mirror,revision],check=True)
+              subprocess.run(['git','-C',str(path),'checkout','--detach','FETCH_HEAD'],check=True)
+          mesa=json.loads(Path('scripts/data/adreno-compiler-inputs.json').read_text())
+          source=Path('.cache/mesa-work')
+          checkout(source,mesa['mesa']['mirror'],mesa['mesa']['commit'],mesa['mesa']['repository'])
+          for patch in mesa['patches']:
+              subprocess.run(['git','-C',str(source),'apply',str(Path(patch).resolve())],check=True)
+          bridge=json.loads(Path('scripts/data/gpu-metal-vulkan-inputs.json').read_text())['translator']
+          checkout(Path('.cache/gpu-reference/metal2vulkan'),bridge['repository'],bridge['commit'])
+          # IN2020/A650 retains the established no-concurrent-binning policy.
+          # Other upstream work-placement and compiler optimizations stay enabled.
+          p=Path('drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm')
+          text=p.read_text()
+          anchor='        exceptiondiag::start();'
+          assert text.count(anchor)==1
+          text=text.replace(anchor,'        setenv("TU_DEBUG", "nocb", 0);\n'+anchor,1)
+          p.write_text(text)
+          # This post-link optimizer requires chained imports. Do not depend on
+          # the selected Xcode linker's default for -undefined dynamic_lookup.
+          p=Path('scripts/build-turnip-darwin.py')
+          text=p.read_text()
+          old="% (k, flags) for k in ('c_args', 'cpp_args', 'objc_args', 'c_link_args', 'cpp_link_args',"
+          new="% (k, flags + (['-Wl,-fixup_chains'] if k.endswith('_link_args') else [])) for k in ('c_args', 'cpp_args', 'objc_args', 'c_link_args', 'cpp_link_args',"
+          assert text.count(old)==1
+          p.write_text(text.replace(old,new,1))
+          Path('build').mkdir(exist_ok=True)
+          Path('build/in2020-build-inputs.json').write_text(json.dumps({
+              'core':'2b545eae50733c62a18f175214c34e7122f82422',
+              'metal':'73d582fd4d5772b1f5fa83581a25077a16f2b6cd',
+              'mesa':mesa['mesa']['commit'],'translator':bridge['commit'],
+              'target':'arm64-apple-ios17.0','board_tu_default':'nocb',
+              'turnip_link_policy':'explicit-fixup-chains',
+              'board_framebuffer_policy':'21H461-bgra-opt-in',
+              'hardware_verified':False},indent=2)+'\n')
+          PY
+          python3 ../board-build/.github/in2020/r3/patch_policy.py
+          clang++ -std=c++17 -Wall -Wextra -Werror ../board-build/.github/in2020/r3/test_policy.cpp -o /tmp/in2020-fb-policy-test
+          /tmp/in2020-fb-policy-test
+      - name: Preflight the patched iOS plugin before the expensive runtime build
+        working-directory: unixnu
+        run: |
+          python3 scripts/gen-turnip-smoke-shaders.py
+          python3 - <<'PY'
+          import subprocess
+          sdk=subprocess.check_output(['xcrun','--sdk','iphoneos','--show-sdk-path'],text=True).strip()
+          subprocess.run(['xcrun','clang++','-target','arm64-apple-ios17.0','-isysroot',sdk,
+              '-std=c++17','-fobjc-arc','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations',
+              '-DNATIVE_METAL_BUILD_ID="preflight"','-I','drivers/Adreno740','-I','kits/AdrenoPM4',
+              '-I','.cache/mesa-work/include','-I','build/turnip-smoke','-x','objective-c++','-fsyntax-only',
+              'drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm'],check=True)
+          PY
+      - name: Rebuild Turnip, runtime and signed Metal bundle
+        working-directory: unixnu
+        run: |
+          python3 scripts/build-turnip-darwin.py --target ios
+          # Fail before the expensive bridge build if the actual format is wrong.
+          python3 - <<'PY'
+          import struct
+          from pathlib import Path
+          p=Path('build/mesa-tu-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib')
+          data=p.read_bytes()
+          assert struct.unpack_from('<I',data)[0]==0xfeedfacf
+          at=32; found=False
+          for _ in range(struct.unpack_from('<I',data,16)[0]):
+              command,size=struct.unpack_from('<II',data,at)
+              assert size>=8 and at+size<=len(data)
+              if command==0x80000034:found=True
+              at+=size
+          assert found,'Turnip lacks LC_DYLD_CHAINED_FIXUPS'
+          print('PASS: rebuilt Turnip has the chained fixups required by self-binding')
+          PY
+          python3 scripts/build-adreno-metal-plugin.py --target ios --no-replay
+          python3 scripts/make-gpu-addon.py --publish --no-daemon build/gpuaddon.bin
+          shasum -a 256 build/gpuaddon.bin
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: in2020-gpu-r3-ios17
+          path: |
+            unixnu/build/gpuaddon.bin
+            unixnu/build/adreno-metal-plugin/trust.json
+            unixnu/build/adreno-metal-plugin/NativeAdrenoMetal.bundle/gpu-build.json
+            unixnu/build/in2020-build-inputs.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Retain diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: in2020-gpu-r3-diagnostics
+          path: |
+            unixnu/.cache/*turnip*.log
+            unixnu/.cache/mesa-tu-*.log
+            unixnu/build/mesa-tu-ios/meson-logs/meson-log.txt
+            unixnu/build/adreno-metal-bridge/build-ios.log
+            unixnu/build/in2020-build-inputs.json
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 7
